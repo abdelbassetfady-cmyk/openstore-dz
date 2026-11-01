@@ -20,7 +20,7 @@
 --   2. Every policy has WITH CHECK, not only USING.
 --   3. Prices are never trusted from the browser. Totals and tax are recomputed
 --      in the database from the price list, in the order's own currency.
---   4. Money is INTEGER minor units (cents). USD 29.00 is 2900; DZD 2500 is 2500 (whole dinars).
+--   4. Money is INTEGER minor units (cents). USD 29.00 is 2900; CLP 27900 is 27900 (no minor unit).
 --      `currencies.minor_digits` says how many decimals a currency has.
 --   5. A browser can never mark an order paid. Only mark_order_paid(), which is
 --      executable by service_role alone, can do it, and it checks that the amount
@@ -43,28 +43,42 @@
 --   Download     browser asks your server -> server calls authorize_download(token,
 --                file_id) -> gets a storage path -> createSignedUrl(path, 60).
 --
--- THREE WAYS TO PAY, one table: payment_methods
+-- WHO THIS SHOP SELLS TO
 --
---   ccp     MANUAL, for buyers in Algeria. The buyer pays the shop's CCP account
---           (Algerie Poste) in dinars, uploads the receipt and types its number.
---           The order goes pending -> verifying; an admin compares the receipt
---           with the account and confirms with confirm_manual_payment(), or
---           rejects it with reject_payment_proof() and the buyer may try again.
---   paypal  ONLINE, for everyone else. Your server opens a PayPal order and a
---           webhook calls mark_order_paid().
---   card    ONLINE, bank cards through Stripe. Same webhook path as PayPal.
+-- Seeded for LATIN AMERICA, and NOT for Algeria. store_settings.allowed_countries
+-- lists the countries served and blocked_countries carries DZ, so place_order()
+-- refuses a buyer in Algeria ('country_blocked') and in any country outside the
+-- list ('country_not_served'), whatever the front-end sends. Empty
+-- allowed_countries to sell worldwide; edit either list in the dashboard (owner
+-- only). Venezuela and Cuba are left out of the seed because of sanctions and
+-- payment restrictions: check that before adding them.
 --
--- Each method says which currencies and countries it accepts, so a CCP order can
--- only be in DZD from Algeria, and PayPal / card can never be offered in DZD.
--- All three are seeded SWITCHED OFF: ccp carries placeholder account details and
--- the online two need your server code, so none may take an order until you turn
--- it on in the dashboard (owner only). `details` is shown to buyers: never put a
--- secret in it. Provider keys belong in your server's environment, not here.
+-- HOW BUYERS PAY, one table: payment_methods (all seeded SWITCHED OFF)
 --
--- Tax: the database computes tax from `tax_rates` for the buyer's country. It
--- seeds NO rates, because rates change and being wrong is your liability. For
--- cross-border digital sales (EU VAT, UK VAT, US state tax) consider a merchant
--- of record (Paddle, Lemon Squeezy) or Stripe Tax instead of maintaining rates.
+--   card      ONLINE. Bank cards through a provider. Your server opens the session
+--             and a webhook calls mark_order_paid().
+--   paypal    ONLINE, USD only. Same webhook path.
+--   transfer  MANUAL. Bank transfer, PIX, SPEI ...: the buyer pays your account in
+--             that country, uploads the receipt and types its number. The order
+--             goes pending -> verifying; an admin confirms with
+--             confirm_manual_payment() or rejects with reject_payment_proof() and
+--             the buyer may try again. Only useful if you hold an account where
+--             the buyer pays; the details in the seed are placeholders.
+--
+-- Cards alone leave many Latin American buyers out: PIX in Brazil, OXXO in Mexico
+-- and PSE in Colombia are how a lot of people pay online. Add one row per method
+-- you can really accept, as kind 'online' with the provider that settles it, or as
+-- a manual transfer. Each method says which currencies and countries it takes.
+-- `details` is shown to buyers: never put a secret in it. Provider keys belong in
+-- your server's environment, not here.
+--
+-- TAX. The database computes tax from `tax_rates` for the buyer's country, and
+-- seeds NO rates: they change, and being wrong is your liability. Several Latin
+-- American countries tax digital goods sold by a foreign seller (Chile and
+-- Colombia from the first sale; Mexico, Peru and Uruguay too; Brazil is phasing in
+-- a new VAT), so selling yourself can mean registering with each tax authority.
+-- The usual way out is a merchant of record: it is the legal seller and remits the
+-- tax. In that case keep collect_tax OFF here and let the provider charge it.
 --
 -- =============================================================================
 
@@ -271,11 +285,20 @@ create table if not exists public.product_files (
   created_at    timestamptz not null default now()
 );
 
+-- Where a file really lives. Exactly one of the two columns is set:
+--   storage_path  a file in the private 'digital-files' bucket (limited, signed,
+--                 revocable: the recommended way)
+--   external_url  an https link on another host (Google Drive, Mega, your own
+--                 server) for a seller who keeps files elsewhere. It stays secret
+--                 like the path: it leaves the database only after payment, only
+--                 to your server, and each release is counted. But once released,
+--                 anyone holding the link can share it, and a link outside your
+--                 bucket cannot be limited or revoked afterwards.
 create table if not exists public.product_file_paths (
   file_id       uuid primary key references public.product_files(id) on delete cascade,
-  -- Path inside the private 'digital-files' bucket.
-  storage_path  text not null unique
-                check (storage_path !~ '^/' and storage_path !~ '\.\.')
+  storage_path  text unique check (storage_path !~ '^/' and storage_path !~ '\.\.'),
+  external_url  text check (external_url ~ '^https://[^[:space:]]+$' and length(external_url) <= 2000),
+  check (num_nonnulls(storage_path, external_url) = 1)
 );
 
 -- Pre-loaded keys (license_mode = 'pool') and minted keys ('generated').
@@ -306,7 +329,7 @@ create table if not exists public.blocked_emails (
   created_at  timestamptz not null default now()
 );
 
--- How a buyer can pay. `manual` methods (CCP) are confirmed by a person; `online`
+-- How a buyer can pay. `manual` methods (bank transfer, PIX, SPEI) are confirmed by a person; `online`
 -- methods name a provider whose webhook confirms them.
 create table if not exists public.payment_methods (
   code          text primary key check (code ~ '^[a-z][a-z0-9_]{1,30}$'),
@@ -316,16 +339,17 @@ create table if not exists public.payment_methods (
   translations  jsonb not null default '{}'::jsonb check (jsonb_typeof(translations) = 'object'),
   -- Shown to the buyer while the order is unpaid (how to pay, what to send).
   instructions  text,
-  -- PUBLIC payee details for a manual method (account holder, CCP number, key,
-  -- RIP). The buyer must see them to pay. Never store a secret here.
+  -- PUBLIC payee details for a manual method (account holder, bank, account
+  -- number, PIX key, CLABE ...). The buyer must see them to pay. Never store a
+  -- secret here.
   details       jsonb not null default '{}'::jsonb check (jsonb_typeof(details) = 'object'),
-  -- Empty list means "any". ccp: {DZD} / {DZ}. paypal and card: no DZD.
+  -- Empty list means "any". Example: a PIX method would be {BRL} / {BR}.
   currencies    text[] not null default '{}'
                 check (array_to_string(currencies, '') ~ '^([A-Z]{3})*$'),
   countries     text[] not null default '{}'
                 check (array_to_string(countries, '') ~ '^([A-Z]{2})*$'),
   -- How long an unpaid order is held before it expires. A transfer takes longer
-  -- than a card, so CCP gets days and the online methods get hours.
+  -- than a card, so a transfer gets days and the online methods get hours.
   hold_hours    int not null default 24 check (hold_hours between 1 and 720),
   is_active     boolean not null default false,
   sort_order    int not null default 0,
@@ -345,7 +369,7 @@ create table if not exists public.orders (
   currency       text not null references public.currencies(code),
   locale         text check (locale ~ '^[a-z]{2,3}(-[A-Za-z]{2,4})?$'),
   -- Optional contact number (WhatsApp or phone). Required for a manual payment
-  -- such as CCP, where an admin may need to reach the buyer about the receipt.
+  -- such as a bank transfer, where an admin may need to reach the buyer about the receipt.
   phone          text check (phone ~ '^[0-9+()\s\-]{6,24}$'),
   payment_method text references public.payment_methods(code),
 
@@ -442,7 +466,7 @@ create table if not exists public.reviews (
 create unique index if not exists reviews_one_per_purchase
   on public.reviews (order_id, product_id) where order_id is not null;
 
--- Receipts for manual payments (CCP). One order may collect several attempts: an
+-- Receipts for manual payments (bank transfer). One order may collect several attempts: an
 -- admin can reject a receipt and the buyer sends another. The same receipt number
 -- cannot back two orders (see payment_proofs_ref_key), which is the classic way
 -- to claim goods twice with one transfer.
@@ -451,7 +475,7 @@ create table if not exists public.payment_proofs (
   order_id      uuid not null references public.orders(id) on delete cascade,
   method        text not null references public.payment_methods(code),
   sender_name   text not null check (length(btrim(sender_name)) between 2 and 120),
-  -- The number printed on the CCP receipt or transfer confirmation.
+  -- The number printed on the transfer receipt or confirmation.
   reference     text not null check (length(btrim(reference)) between 3 and 100),
   -- Path in the private 'payment-proofs' bucket: <order public_token>/<file>.
   storage_path  text check (storage_path is null or (storage_path !~ '^/' and storage_path !~ '\.\.'
@@ -1082,7 +1106,7 @@ begin
     v_order.status := 'paid';
   end if;
 
-  -- payment_kind tells the checkout what to do next: 'manual' shows the CCP
+  -- payment_kind tells the checkout what to do next: 'manual' shows the transfer
   -- instructions and the receipt form, 'online' sends the buyer to the provider
   -- (your server opens the session), 'free' needs nothing.
   return jsonb_build_object(
@@ -1169,7 +1193,7 @@ begin
 end;
 $$;
 
--- ── Manual payments (CCP) ──────────────────────────────────────────────────
+-- ── Manual payments (bank transfer) ──────────────────────────────────────────────────
 
 -- May this storage path receive a receipt? Used by the storage policy below, so a
 -- buyer can upload straight from the browser without a server round trip, yet
@@ -1378,7 +1402,7 @@ end;
 $$;
 
 -- Close orders nobody paid. Schedule it (pg_cron, or a cron-triggered function).
--- Each order is held for ITS payment method's hold_hours: days for a CCP transfer,
+-- Each order is held for ITS payment method's hold_hours: days for a bank transfer,
 -- hours for a card. An order in 'verifying' never expires; a person decides it.
 create or replace function public.expire_pending_orders()
 returns int
@@ -1402,9 +1426,10 @@ begin
 end;
 $$;
 
--- Check a download and spend one of its uses. Returns the private storage path
--- to YOUR server, which then signs a short-lived URL. A use is spent when the
--- URL is issued, not when the transfer finishes.
+-- Check a download and spend one of its uses. Returns to YOUR server either a
+-- private storage_path (sign a short-lived URL for it) or an external_url
+-- (redirect to it); exactly one of the two is non-null. A use is spent when the
+-- answer is issued, not when the transfer finishes.
 create or replace function public.authorize_download(
   p_token     uuid,
   p_file_id   uuid,
@@ -1419,6 +1444,7 @@ declare
   v_file   record;
   v_ent    public.entitlements%rowtype;
   v_path   text;
+  v_url    text;
 begin
   select o.id, o.status into v_order from public.orders o where o.public_token = p_token;
   if not found or v_order.status <> 'paid' then
@@ -1448,8 +1474,9 @@ begin
     raise exception 'Download limit reached' using errcode = 'check_violation', hint = 'limit_reached';
   end if;
 
-  select fp.storage_path into v_path from public.product_file_paths fp where fp.file_id = v_file.id;
-  if v_path is null then
+  select fp.storage_path, fp.external_url into v_path, v_url
+    from public.product_file_paths fp where fp.file_id = v_file.id;
+  if not found or (v_path is null and v_url is null) then
     raise exception 'File is not available' using errcode = 'check_violation', hint = 'not_found';
   end if;
 
@@ -1457,7 +1484,7 @@ begin
   insert into public.download_log (entitlement_id, file_id, client_key)
   values (v_ent.id, v_file.id, p_client_key);
 
-  return jsonb_build_object('storage_path', v_path, 'file_name', v_file.name);
+  return jsonb_build_object('storage_path', v_path, 'external_url', v_url, 'file_name', v_file.name);
 end;
 $$;
 
@@ -2102,7 +2129,7 @@ begin
 end $$;
 
 
--- payment-proofs PRIVATE. CCP receipts. A buyer may INSERT (never read, list,
+-- payment-proofs PRIVATE. Transfer receipts. A buyer may INSERT (never read, list,
 --                overwrite or delete) a file into the folder named after their own
 --                order's token, only while that order awaits a manual payment, and
 --                at most five files per order: that is what can_upload_proof()
@@ -2123,48 +2150,55 @@ create policy "Buyers upload payment proofs"
 
 insert into public.currencies (code, name, minor_digits, sort_order) values
   ('USD', 'US Dollar',      2, 1),
-  ('EUR', 'Euro',           2, 2),
-  ('GBP', 'British Pound',  2, 3),
-  -- DZD in whole dinars, as in OpenStore DZ: 2500 means 2500 DA. It is used with
-  -- CCP only; PayPal and card cannot take it.
-  ('DZD', 'Algerian Dinar',  0, 4)
+  ('MXN', 'Mexican Peso',   2, 2),
+  ('BRL', 'Brazilian Real', 2, 3),
+  ('COP', 'Colombian Peso', 2, 4),
+  -- CLP has no minor unit: 27900 means 27,900 pesos.
+  ('CLP', 'Chilean Peso',   0, 5),
+  ('PEN', 'Peruvian Sol',   2, 6)
 on conflict (code) do nothing;
 
+-- Served: Latin America. Not served: Algeria. Venezuela and Cuba are left out on
+-- purpose (see the header). Change either list in the dashboard.
 insert into public.store_settings (
-  id, name, tagline, description, support_email, default_currency
+  id, name, tagline, description, support_email, default_currency, default_locale,
+  allowed_countries, blocked_countries
 ) values (
   1,
   'OpenStore Digital',
-  'Instant delivery. Download in seconds.',
-  'This is the demo shop created by schema.sql. Edit it in Settings, or delete the demo products and add your own.',
+  'Entrega instantánea. Descarga en segundos.',
+  'Esta es la tienda de demostración creada por schema.sql. Edítala en Ajustes, o borra los productos de ejemplo y agrega los tuyos.',
   'support@example.com',
-  'USD'
+  'USD',
+  'es',
+  array['AR','BO','BR','CL','CO','CR','DO','EC','SV','GT','HN','MX','NI','PA','PY','PE','PR','UY'],
+  array['DZ']
 )
 on conflict (id) do nothing;
 
--- The three payment methods, all OFF. Turn one on in the dashboard once it is
--- ready: ccp after you replace the placeholder account below with your own (a
--- buyer would otherwise pay a stranger), paypal and card after your server can
+-- The payment methods, all OFF. Turn one on in the dashboard once it is ready:
+-- `transfer` after you replace the placeholder account below with your own (a
+-- buyer would otherwise pay a stranger), `card` and `paypal` after your server can
 -- open sessions and receive their webhooks. Seeded regardless of demo content, and
 -- never overwritten, so your edits survive a re-run.
 insert into public.payment_methods
   (code, kind, provider, label, translations, instructions, details, currencies, countries,
    hold_hours, is_active, sort_order)
 values
-  ('ccp', 'manual', null, 'CCP (Algerie Poste)',
-   '{"ar": {"label": "بريد الجزائر (CCP)", "instructions": "حوّل المبلغ بالضبط إلى الحساب البريدي الجاري أدناه، ثم ارفع صورة الوصل وأدخل رقمه. نؤكد طلبك خلال 24 ساعة."},
-     "fr": {"label": "CCP (Algérie Poste)", "instructions": "Versez le montant exact sur le compte CCP ci-dessous, puis envoyez la photo du reçu et son numéro. Nous confirmons sous 24 h."}}'::jsonb,
-   'Send the exact total to the CCP account below, then upload a photo of the receipt and enter its number. We confirm your order within 24 hours.',
-   '{"account_holder": "CHANGE ME", "ccp_number": "0000000000", "ccp_key": "00", "rip": "00799999000000000000"}'::jsonb,
-   array['DZD'], array['DZ'], 72, false, 1),
-  ('paypal', 'online', 'paypal', 'PayPal',
-   '{"ar": {"label": "باي بال"}, "fr": {"label": "PayPal"}}'::jsonb,
-   null, '{}'::jsonb,
-   array['USD', 'EUR', 'GBP'], '{}', 24, false, 2),
   ('card', 'online', 'stripe', 'Credit / debit card',
-   '{"ar": {"label": "بطاقة بنكية"}, "fr": {"label": "Carte bancaire"}}'::jsonb,
+   '{"es": {"label": "Tarjeta de crédito / débito"}, "pt": {"label": "Cartão de crédito / débito"}}'::jsonb,
    null, '{}'::jsonb,
-   array['USD', 'EUR', 'GBP'], '{}', 24, false, 3)
+   '{}', '{}', 24, false, 1),
+  ('paypal', 'online', 'paypal', 'PayPal',
+   '{"es": {"label": "PayPal"}, "pt": {"label": "PayPal"}}'::jsonb,
+   null, '{}'::jsonb,
+   array['USD'], '{}', 24, false, 2),
+  ('transfer', 'manual', null, 'Bank transfer (SPEI / PIX)',
+   '{"es": {"label": "Transferencia bancaria (SPEI)", "instructions": "Transfiere el monto exacto a la cuenta de abajo, luego sube la foto del comprobante e ingresa su número. Confirmamos tu pedido en 24 horas."},
+     "pt": {"label": "Transferência bancária (Pix)", "instructions": "Transfira o valor exato para a conta abaixo, depois envie a foto do comprovante e informe o número. Confirmamos seu pedido em até 24 horas."}}'::jsonb,
+   'Send the exact total to the account below, then upload a photo of the receipt and enter its number. We confirm your order within 24 hours.',
+   '{"account_holder": "CHANGE ME", "bank": "CHANGE ME", "clabe": "", "pix_key": ""}'::jsonb,
+   array['MXN', 'BRL'], array['MX', 'BR'], 72, false, 3)
 on conflict (code) do nothing;
 
 do $$
@@ -2173,9 +2207,9 @@ begin
     return;
   end if;
 
-  insert into public.categories (slug, name, sort_order) values
-    ('templates', 'Templates', 1),
-    ('software',  'Software',  2)
+  insert into public.categories (slug, name, translations, sort_order) values
+    ('templates', 'Templates', '{"es": {"name": "Plantillas"}, "pt": {"name": "Modelos"}}'::jsonb, 1),
+    ('software',  'Software',  '{"es": {"name": "Software"},  "pt": {"name": "Software"}}'::jsonb, 2)
   on conflict (slug) do nothing;
 
   -- Three products that between them exercise every delivery path:
@@ -2183,32 +2217,47 @@ begin
   --                                      can test delivery with no payment provider
   --   starter-ui-kit paid + a file    -> goes through your payment webhook
   --   pro-app        paid + license   -> a generated key per purchase
-  insert into public.products (id, slug, name, description, status, category_id, license_mode, version, published_at)
+  insert into public.products (id, slug, name, description, translations, status, category_id,
+                               license_mode, version, published_at)
   values
     ('11111111-1111-4111-8111-111111111111', 'free-sampler',
      'Free Sampler Pack', 'A small free pack. Great for testing the whole delivery flow.',
+     '{"es": {"name": "Paquete de muestra gratis", "description": "Un pequeño paquete gratuito. Ideal para probar todo el proceso de entrega."},
+       "pt": {"name": "Pacote de amostra grátis", "description": "Um pequeno pacote gratuito. Ótimo para testar todo o processo de entrega."}}'::jsonb,
      'published', (select id from public.categories where slug = 'templates'), 'none', '1.0', now()),
     ('22222222-2222-4222-8222-222222222222', 'starter-ui-kit',
      'Starter UI Kit', 'A clean UI kit with components, icons and example screens.',
+     '{"es": {"name": "Kit de interfaz inicial", "description": "Un kit de interfaz limpio con componentes, iconos y pantallas de ejemplo."},
+       "pt": {"name": "Kit de interface inicial", "description": "Um kit de interface limpo com componentes, ícones e telas de exemplo."}}'::jsonb,
      'published', (select id from public.categories where slug = 'templates'), 'none', '2.1', now()),
     ('33333333-3333-4333-8333-333333333333', 'pro-app',
      'Pro App License', 'A lifetime license key for the Pro edition.',
+     '{"es": {"name": "Licencia Pro App", "description": "Una clave de licencia de por vida para la edición Pro."},
+       "pt": {"name": "Licença Pro App", "description": "Uma chave de licença vitalícia para a edição Pro."}}'::jsonb,
      'published', (select id from public.categories where slug = 'software'), 'generated', '5.0', now())
   on conflict (id) do nothing;
 
+  -- Demo prices, roughly converted: set your own. Amounts are in minor units
+  -- (USD 2900 = 29.00, CLP 27900 = 27,900 pesos).
   insert into public.product_prices (product_id, currency, amount, compare_at_amount) values
     ('11111111-1111-4111-8111-111111111111', 'USD', 0, null),
-    ('11111111-1111-4111-8111-111111111111', 'EUR', 0, null),
-    ('11111111-1111-4111-8111-111111111111', 'GBP', 0, null),
-    ('11111111-1111-4111-8111-111111111111', 'DZD', 0, null),
+    ('11111111-1111-4111-8111-111111111111', 'MXN', 0, null),
+    ('11111111-1111-4111-8111-111111111111', 'BRL', 0, null),
+    ('11111111-1111-4111-8111-111111111111', 'COP', 0, null),
+    ('11111111-1111-4111-8111-111111111111', 'CLP', 0, null),
+    ('11111111-1111-4111-8111-111111111111', 'PEN', 0, null),
     ('22222222-2222-4222-8222-222222222222', 'USD', 2900, null),
-    ('22222222-2222-4222-8222-222222222222', 'EUR', 2700, null),
-    ('22222222-2222-4222-8222-222222222222', 'GBP', 2300, null),
-    ('22222222-2222-4222-8222-222222222222', 'DZD', 2500, null),
+    ('22222222-2222-4222-8222-222222222222', 'MXN', 49900, null),
+    ('22222222-2222-4222-8222-222222222222', 'BRL', 14900, null),
+    ('22222222-2222-4222-8222-222222222222', 'COP', 11900000, null),
+    ('22222222-2222-4222-8222-222222222222', 'CLP', 27900, null),
+    ('22222222-2222-4222-8222-222222222222', 'PEN', 10900, null),
     ('33333333-3333-4333-8333-333333333333', 'USD', 4900, 5900),
-    ('33333333-3333-4333-8333-333333333333', 'EUR', 4500, 5500),
-    ('33333333-3333-4333-8333-333333333333', 'GBP', 3900, 4900),
-    ('33333333-3333-4333-8333-333333333333', 'DZD', 7500, 9000)
+    ('33333333-3333-4333-8333-333333333333', 'MXN', 84900, 99900),
+    ('33333333-3333-4333-8333-333333333333', 'BRL', 24900, 29900),
+    ('33333333-3333-4333-8333-333333333333', 'COP', 19900000, 23900000),
+    ('33333333-3333-4333-8333-333333333333', 'CLP', 46900, 55900),
+    ('33333333-3333-4333-8333-333333333333', 'PEN', 17900, 21900)
   on conflict (product_id, currency) do nothing;
 
   update public.products set cover_image_url = 'https://picsum.photos/seed/openstore-sampler/900/600'
@@ -2234,7 +2283,6 @@ begin
   on conflict (file_id) do nothing;
 end;
 $$;
-
 
 -- =============================================================================
 -- 9. Upgrades
